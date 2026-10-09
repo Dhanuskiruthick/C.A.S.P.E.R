@@ -1,8 +1,7 @@
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from schemas import SensorReading, LoginRequest
+from schemas import SensorReading
 from datetime import datetime
 import sqlite3
 import logging
@@ -42,15 +41,10 @@ def init_db():
 
 init_db()
 
-security = HTTPBearer()
-
+# Keep hardware security so ESP32 code works
 def verify_hardware(x_api_key: str = Header(...)):
     if x_api_key != "esp32-secret-key-2026":
         raise HTTPException(status_code=401, detail="Unauthorized hardware")
-
-def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.credentials != "admin-session-token-2026":
-        raise HTTPException(status_code=401, detail="Invalid token")
 
 def detect_anomaly(temp, current, smoke, leak):
     if temp > 45 or current > 7 or smoke == "Warning" or leak:
@@ -58,13 +52,6 @@ def detect_anomaly(temp, current, smoke, leak):
     elif temp > 35:
         return "Warning", "Elevated temperature detected."
     return "Normal", None
-
-@app.post("/api/v1/login")
-async def login(credentials: LoginRequest):
-    # Enforcing the requested CASPER credentials
-    if credentials.username == "CASPER" and credentials.password == "CASPER26":
-        return {"access_token": "admin-session-token-2026", "token_type": "bearer"}
-    raise HTTPException(status_code=401, detail="Invalid credentials")
 
 @app.post("/api/v1/readings", dependencies=[Depends(verify_hardware)])
 async def receive_reading(reading: SensorReading):
@@ -85,7 +72,8 @@ async def receive_reading(reading: SensorReading):
     conn.close()
     return {"message": "Reading stored", "status": status}
 
-@app.get("/api/v1/dashboard", dependencies=[Depends(verify_admin)])
+# Dashboard is now 100% public. No token required.
+@app.get("/api/v1/dashboard")
 async def get_dashboard():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
