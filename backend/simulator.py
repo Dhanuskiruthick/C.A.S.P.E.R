@@ -2,7 +2,7 @@ import time
 import requests
 import random
 
-URL = "http://localhost:8000/api/v1/readings"
+URL = "https://c-a-s-p-e-r.onrender.com/api/v1/readings"
 HEADERS = {"x-api-key": "esp32-secret-key-2026"}
 
 print("Starting ESP32 Simulator...")
