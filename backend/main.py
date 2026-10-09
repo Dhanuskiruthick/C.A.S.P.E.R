@@ -1,19 +1,34 @@
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from schemas import SensorReading, LoginRequest
 from datetime import datetime
 import sqlite3
+import logging
 
+logging.basicConfig(level=logging.ERROR)
 
+app = FastAPI(title="C.A.S.P.E.R. - Smart Campus API")
 
-# 1. CHANGE DB NAME to v2 to force a fresh schema creation
-DB_NAME = "campus_data_v2.db" 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logging.error(f"Internal Error on {request.method} {request.url.path}: {exc}")
+    return JSONResponse(status_code=500, content={"detail": "Internal server error."})
+
+DB_NAME = "campus_data_v2.db"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Added humidity, water_leak, and occupancy columns
     cursor.execute('''CREATE TABLE IF NOT EXISTS readings (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         timestamp TEXT, temperature REAL, humidity REAL, current REAL, 
@@ -27,59 +42,70 @@ def init_db():
 
 init_db()
 
-# ... [Keep verify_hardware, verify_admin, login, and detect_anomaly functions] ...
+security = HTTPBearer()
+
+def verify_hardware(x_api_key: str = Header(...)):
+    if x_api_key != "esp32-secret-key-2026":
+        raise HTTPException(status_code=401, detail="Unauthorized hardware")
+
+def verify_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if credentials.credentials != "admin-session-token-2026":
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+def detect_anomaly(temp, current, smoke, leak):
+    if temp > 45 or current > 7 or smoke == "Warning" or leak:
+        return "Critical", f"Danger: Temp {temp}C, Current {current}A, Smoke: {smoke}, Leak: {leak}"
+    elif temp > 35:
+        return "Warning", "Elevated temperature detected."
+    return "Normal", None
+
+@app.post("/api/v1/login")
+async def login(credentials: LoginRequest):
+    # Enforcing the requested CASPER credentials
+    if credentials.username == "CASPER" and credentials.password == "CASPER26":
+        return {"access_token": "admin-session-token-2026", "token_type": "bearer"}
+    raise HTTPException(status_code=401, detail="Invalid credentials")
 
 @app.post("/api/v1/readings", dependencies=[Depends(verify_hardware)])
 async def receive_reading(reading: SensorReading):
-    status, alert_reason = detect_anomaly(reading.temperature, reading.current)
-    # AI team can expand detect_anomaly() later to use the new fields
-    
+    status, alert_reason = detect_anomaly(reading.temperature, reading.current, reading.smoke_status, reading.water_leak)
     timestamp = datetime.utcnow().isoformat()
+    
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
-    # Updated INSERT statement
     cursor.execute("""
         INSERT INTO readings (timestamp, temperature, humidity, current, smoke_status, water_leak, occupancy, is_simulated, status) 
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (timestamp, reading.temperature, reading.humidity, reading.current, reading.smoke_status, reading.water_leak, reading.occupancy, reading.is_simulated, status))
     
-    if status == "Critical":
+    if status in ["Critical", "Warning"]:
         cursor.execute("INSERT INTO alerts (timestamp, reason) VALUES (?, ?)", (timestamp, alert_reason))
     
     conn.commit()
     conn.close()
-    return {"message": "Expanded reading stored permanently", "status": status}
+    return {"message": "Reading stored", "status": status}
 
 @app.get("/api/v1/dashboard", dependencies=[Depends(verify_admin)])
 async def get_dashboard():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
-    # Updated SELECT statement
     cursor.execute("""
         SELECT timestamp, temperature, humidity, current, smoke_status, water_leak, occupancy, is_simulated, status 
         FROM readings ORDER BY id DESC LIMIT 1
     """)
     latest_row = cursor.fetchone()
     
-    cursor.execute("SELECT timestamp, reason FROM alerts ORDER BY id DESC LIMIT 5")
+    cursor.execute("SELECT timestamp, reason FROM alerts ORDER BY id DESC LIMIT 10")
     alerts_rows = cursor.fetchall()
     conn.close()
 
     if not latest_row:
         return {"status": "Waiting for data...", "latest_reading": None, "recent_alerts": []}
 
-    # Map the fetched row correctly
     latest_reading = {
-        "timestamp": latest_row[0], 
-        "temperature": latest_row[1], 
-        "humidity": latest_row[2],
-        "current": latest_row[3],
-        "smoke_status": latest_row[4], 
-        "water_leak": bool(latest_row[5]),
-        "occupancy": latest_row[6],
-        "is_simulated": bool(latest_row[7])
+        "timestamp": latest_row[0], "temperature": latest_row[1], "humidity": latest_row[2],
+        "current": latest_row[3], "smoke_status": latest_row[4], "water_leak": bool(latest_row[5]),
+        "occupancy": latest_row[6], "is_simulated": bool(latest_row[7])
     }
     
     recent_alerts = [{"timestamp": row[0], "reason": row[1]} for row in alerts_rows]
