@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from schemas import SensorReading
+from pydantic import BaseModel
 from datetime import datetime
 import sqlite3
 import logging
@@ -10,6 +10,7 @@ logging.basicConfig(level=logging.ERROR)
 
 app = FastAPI(title="C.A.S.P.E.R. - Smart Campus API")
 
+# --- CORS Configuration ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -18,13 +19,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Global Exception Handler ---
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logging.error(f"Internal Error on {request.method} {request.url.path}: {exc}")
     return JSONResponse(status_code=500, content={"detail": "Internal server error."})
 
+# --- Pydantic Schema for ESP32 JSON Payload ---
+class SensorReading(BaseModel):
+    temperature: float
+    humidity: float
+    current: float
+    smoke_status: str
+    water_leak: bool
+    occupancy: int
+    is_simulated: bool
+
 DB_NAME = "campus_data_v2.db"
 
+# --- Database Initialization ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -41,21 +54,40 @@ def init_db():
 
 init_db()
 
-# Keep hardware security so ESP32 code works
+# --- Hardware Security ---
 def verify_hardware(x_api_key: str = Header(...)):
     if x_api_key != "esp32-secret-key-2026":
         raise HTTPException(status_code=401, detail="Unauthorized hardware")
 
+# --- Threshold Logic (100% Synced with ESP32) ---
 def detect_anomaly(temp, current, smoke, leak):
-    if temp > 45 or current > 7 or smoke == "Warning" or leak:
-        return "Critical", f"Danger: Temp {temp}C, Current {current}A, Smoke: {smoke}, Leak: {leak}"
-    elif temp > 35:
-        return "Warning", "Elevated temperature detected."
+    # TEMP_DANGER_C = 45.0
+    # CURRENT_DANGER_A = 30.0
+    
+    # 1. Check for Critical / Danger State
+    if temp >= 45.0 or current >= 30.0 or smoke == "Warning" or leak:
+        reasons = []
+        if temp >= 45.0: reasons.append(f"High Temp ({temp}°C)")
+        if current >= 30.0: reasons.append(f"High Current ({current}A)")
+        if smoke == "Warning": reasons.append("Smoke Detected")
+        if leak: reasons.append("Water Leak Detected")
+        
+        alert_message = " | ".join(reasons)
+        return "Critical", alert_message
+
+    # 2. Check for Warning State
+    elif temp >= 35.0:
+        return "Warning", f"Elevated Temperature ({temp}°C)"
+
+    # 3. Normal State
     return "Normal", None
 
+# --- POST Endpoint: Receive Data from ESP32 ---
 @app.post("/api/v1/readings", dependencies=[Depends(verify_hardware)])
 async def receive_reading(reading: SensorReading):
-    status, alert_reason = detect_anomaly(reading.temperature, reading.current, reading.smoke_status, reading.water_leak)
+    status, alert_reason = detect_anomaly(
+        reading.temperature, reading.current, reading.smoke_status, reading.water_leak
+    )
     timestamp = datetime.utcnow().isoformat()
     
     conn = sqlite3.connect(DB_NAME)
@@ -72,7 +104,7 @@ async def receive_reading(reading: SensorReading):
     conn.close()
     return {"message": "Reading stored", "status": status}
 
-# Dashboard is now 100% public. No token required.
+# --- GET Endpoint: Live Dashboard Data (Public) ---
 @app.get("/api/v1/dashboard")
 async def get_dashboard():
     conn = sqlite3.connect(DB_NAME)
@@ -103,3 +135,26 @@ async def get_dashboard():
         "latest_reading": latest_reading,
         "recent_alerts": recent_alerts
     }
+
+# --- GET Endpoint: Historical Data for the Archive UI ---
+@app.get("/api/v1/history")
+async def get_history(start: str, end: str):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT timestamp, temperature, humidity, current, smoke_status, water_leak, occupancy, status 
+        FROM readings 
+        WHERE timestamp >= ? AND timestamp <= ?
+        ORDER BY id DESC LIMIT 200
+    """, (start + "T00:00:00", end + "T23:59:59"))
+    rows = cursor.fetchall()
+    conn.close()
+
+    history = []
+    for row in rows:
+        history.append({
+            "timestamp": row[0], "temperature": row[1], "humidity": row[2],
+            "current": row[3], "smoke": row[4], "leak": bool(row[5]),
+            "occupancy": row[6], "status": row[7]
+        })
+    return {"records": history}
